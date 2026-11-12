@@ -1,0 +1,135 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null; }
+    function admin() { return signed() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'; }
+    function now() { return request.time.toMillis(); }
+    function recent(n) { return n is int && n >= now()-60000 && n <= now()+60000; }
+    function text(s,lo,hi) { return s is string && s.size() >= lo && s.size() <= hi; }
+    function start(b) {
+      let d = b.date.split('-');
+      return timestamp.date(int(d[0]),int(d[1]),int(d[2])).toMillis() + (b.hour+5)*3600000;
+    }
+    function slotPath(b) { return /databases/$(database)/documents/courts/$(b.courtId)/slots/$(b.date+'_'+string(b.hour)); }
+    function paired(b, hold) { let s = getAfter(slotPath(b)).data; return s.bookingId == b.id && !s.blocked && s.holdUntilMs == hold; }
+    function released(b) { return getAfter(slotPath(b)).data.bookingId != b.id; }
+    function initial(b,id) {
+      let c = get(/databases/$(database)/documents/courts/$(b.courtId)).data;
+      let begin = start(b);
+      let maximum = now()+900000 < begin ? now()+900000 : begin;
+      return signed() && b.id == id && b.userId == request.auth.uid
+        && b.userName == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.fullName
+        && c.active && b.courtName == c.name && b.totalCents == c.priceCents
+        && b.hour is int && b.hour >= c.openingHour && b.hour < c.closingHour
+        && b.date.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}') && b.startMs == begin
+        && begin > now() && begin <= now()+61*86400000
+        && recent(b.createdAtMs) && b.updatedAtMs == b.createdAtMs
+        && b.status == 'Pendiente de pago' && !b.paid && !b.refunded && !b.refundPending
+        && b.paymentMethod == '' && b.paymentReference == '' && b.paymentKey == '' && b.reviewNote == ''
+        && b.reviewedBy == '' && b.refundedBy == '' && b.cancellationReason == ''
+        && b.holdUntilMs <= maximum+60000 && b.holdUntilMs >= maximum-60000
+        && paired(b,b.holdUntilMs);
+    }
+    function submit(a,b) {
+      let maximum = now()+86400000 < a.startMs ? now()+86400000 : a.startMs;
+      let proof = getAfter(/databases/$(database)/documents/paymentProofs/$(b.id)).data;
+      let ref = getAfter(/databases/$(database)/documents/paymentReferences/$(b.paymentKey)).data;
+      return a.userId == request.auth.uid && a.status == 'Pendiente de pago' && a.holdUntilMs > now()
+        && b.status == 'En revisión' && b.diff(a).affectedKeys().hasOnly(['status','updatedAtMs','holdUntilMs','paymentMethod','paymentReference','paymentKey'])
+        && b.paymentMethod in ['Yape','Plin','Transferencia'] && b.paymentReference.matches('[A-Z0-9-]{4,60}')
+        && b.paymentKey == b.paymentMethod+'_'+b.paymentReference
+        && b.holdUntilMs >= maximum-60000 && b.holdUntilMs <= maximum+60000
+        && proof.userId == request.auth.uid && proof.submittedAtMs == b.updatedAtMs
+        && ref.bookingId == b.id && ref.userId == b.userId && ref.method == b.paymentMethod && ref.reference == b.paymentReference
+        && paired(b,b.holdUntilMs);
+    }
+    function cancel(a,b) {
+      return (a.userId == request.auth.uid || admin()) && a.status != 'Cancelada' && b.status == 'Cancelada'
+        && b.diff(a).affectedKeys().hasOnly(['status','updatedAtMs','refundPending','cancellationReason'])
+        && b.refundPending == (a.paid && !a.refunded) && text(b.cancellationReason,3,200) && released(b);
+    }
+    function review(a,b) {
+      return admin() && a.status == 'En revisión' && a.holdUntilMs > now() && b.reviewedBy == request.auth.uid && text(b.reviewNote,3,200)
+        && b.diff(a).affectedKeys().hasOnly(['status','paid','reviewNote','reviewedBy','updatedAtMs'])
+        && ((b.status == 'Confirmada' && b.paid && paired(b,9007199254740991)) || (b.status == 'Cancelada' && !b.paid && released(b)));
+    }
+    function refund(a,b) {
+      return admin() && a.status == 'Cancelada' && a.paid && a.refundPending && !a.refunded
+        && b.refunded && !b.refundPending && b.refundedBy == request.auth.uid
+        && b.diff(a).affectedKeys().hasOnly(['refunded','refundPending','refundedBy','updatedAtMs']);
+    }
+    match /users/{uid} {
+      allow read: if signed() && (uid == request.auth.uid || admin());
+      allow create: if signed() && uid == request.auth.uid && request.resource.data.keys().hasOnly(['uid','fullName','email','phone','role'])
+        && request.resource.data.uid == uid && request.resource.data.email == request.auth.token.email && request.resource.data.role == 'client'
+        && text(request.resource.data.fullName,2,80) && text(request.resource.data.phone,0,25);
+      allow update: if signed() && uid == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fullName','phone'])
+        && text(request.resource.data.fullName,2,80) && text(request.resource.data.phone,0,25);
+      allow delete: if false;
+    }
+    match /courts/{courtId} {
+      allow read: if signed() && (admin() || resource.data.active);
+      allow create, update: if admin() && request.resource.data.id == courtId && text(request.resource.data.name,2,100)
+        && text(request.resource.data.location,2,200) && text(request.resource.data.description,0,1000) && text(request.resource.data.type,2,50)
+        && request.resource.data.priceCents is int && request.resource.data.priceCents >= 100 && request.resource.data.priceCents <= 1000000
+        && request.resource.data.openingHour is int && request.resource.data.closingHour is int
+        && request.resource.data.openingHour >= 0 && request.resource.data.closingHour <= 24 && request.resource.data.openingHour < request.resource.data.closingHour
+        && request.resource.data.active is bool && request.resource.data.latitude >= -90 && request.resource.data.latitude <= 90
+        && request.resource.data.longitude >= -180 && request.resource.data.longitude <= 180;
+      allow delete: if false;
+      match /slots/{slotId} {
+        function shape(s) { return s.keys().hasOnly(['bookingId','date','hour','holdUntilMs','blocked','reason']) && s.blocked is bool && s.hour is int && s.hour >= 0 && s.hour <= 23 && text(s.reason,0,200) && slotId == s.date+'_'+string(s.hour); }
+        function available() { return !exists(/databases/$(database)/documents/courts/$(courtId)/slots/$(slotId)) || (!resource.data.blocked && resource.data.holdUntilMs <= now()); }
+        function linked(s) {
+          let b = getAfter(/databases/$(database)/documents/bookings/$(s.bookingId)).data;
+          return !s.blocked && (b.userId == request.auth.uid || admin()) && b.courtId == courtId && b.date == s.date && b.hour == s.hour
+            && b.startMs > now() && b.status in ['Pendiente de pago','En revisión','Confirmada']
+            && s.holdUntilMs == (b.status == 'Confirmada' ? 9007199254740991 : b.holdUntilMs) && s.holdUntilMs > now();
+        }
+        function free(s) {
+          return s.bookingId == '' && !s.blocked && s.holdUntilMs == 0 && s.reason == ''
+            && ((admin() && resource.data.blocked) || (getAfter(/databases/$(database)/documents/bookings/$(resource.data.bookingId)).data.status == 'Cancelada'
+              && (getAfter(/databases/$(database)/documents/bookings/$(resource.data.bookingId)).data.userId == request.auth.uid || admin())));
+        }
+        allow read: if signed();
+        allow create: if signed() && shape(request.resource.data) && (linked(request.resource.data) || (admin() && request.resource.data.blocked && request.resource.data.bookingId == '' && request.resource.data.holdUntilMs == 9007199254740991));
+        allow update: if signed() && shape(request.resource.data) && ((linked(request.resource.data) && (available() || resource.data.bookingId == request.resource.data.bookingId))
+          || (admin() && (available() || resource.data.blocked) && request.resource.data.blocked && request.resource.data.bookingId == '' && request.resource.data.holdUntilMs == 9007199254740991) || free(request.resource.data));
+        allow delete: if false;
+      }
+    }
+    match /bookings/{id} {
+      allow get: if signed() && (!exists(/databases/$(database)/documents/bookings/$(id)) || resource.data.userId == request.auth.uid || admin());
+      allow list: if signed() && (resource.data.userId == request.auth.uid || admin());
+      allow create: if request.resource.data.keys().hasOnly(['id','userId','userName','courtId','courtName','date','hour','startMs','totalCents','status','createdAtMs','updatedAtMs','holdUntilMs','paid','refunded','refundPending','paymentMethod','paymentReference','paymentKey','reviewNote','reviewedBy','cancellationReason','refundedBy']) && initial(request.resource.data,id);
+      allow update: if signed() && recent(request.resource.data.updatedAtMs) && ((resource.data.startMs > now() && (submit(resource.data,request.resource.data) || cancel(resource.data,request.resource.data) || review(resource.data,request.resource.data))) || refund(resource.data,request.resource.data));
+      allow delete: if false;
+    }
+    match /paymentProofs/{id} {
+      allow read: if signed() && (resource.data.userId == request.auth.uid || admin());
+      allow create, update: if signed() && request.resource.data.keys().hasOnly(['userId','imageBase64','mimeType','submittedAtMs'])
+        && request.resource.data.userId == request.auth.uid && text(request.resource.data.imageBase64,8,270000)
+        && request.resource.data.mimeType in ['image/jpeg','image/png'] && recent(request.resource.data.submittedAtMs)
+        && getAfter(/databases/$(database)/documents/bookings/$(id)).data.userId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/bookings/$(id)).data.status == 'En revisión'
+        && getAfter(/databases/$(database)/documents/bookings/$(id)).data.updatedAtMs == request.resource.data.submittedAtMs;
+      allow delete: if false;
+    }
+    match /paymentReferences/{key} {
+      allow get: if signed() && (!exists(/databases/$(database)/documents/paymentReferences/$(key)) || resource.data.userId == request.auth.uid || admin());
+      allow create: if signed() && request.resource.data.keys().hasOnly(['userId','bookingId','method','reference'])
+        && request.resource.data.userId == request.auth.uid && key == request.resource.data.method+'_'+request.resource.data.reference
+        && getAfter(/databases/$(database)/documents/bookings/$(request.resource.data.bookingId)).data.paymentKey == key
+        && getAfter(/databases/$(database)/documents/bookings/$(request.resource.data.bookingId)).data.status == 'En revisión'
+        && getAfter(/databases/$(database)/documents/bookings/$(request.resource.data.bookingId)).data.userId == request.auth.uid;
+      allow list, update, delete: if false;
+    }
+    match /settings/payment {
+      allow read: if signed();
+      allow create, update: if admin() && request.resource.data.keys().hasOnly(['businessName','instructions','yape','plin','transfer'])
+        && text(request.resource.data.businessName,2,100) && text(request.resource.data.instructions,0,1000)
+        && text(request.resource.data.yape,0,150) && text(request.resource.data.plin,0,150) && text(request.resource.data.transfer,0,300);
+      allow delete: if false;
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "indexes": [
+    { "collectionGroup": "bookings", "queryScope": "COLLECTION", "fields": [{"fieldPath":"userId","order":"ASCENDING"},{"fieldPath":"createdAtMs","order":"DESCENDING"}] }
+  ], "fieldOverrides": [
+    {"collectionGroup":"paymentProofs","fieldPath":"imageBase64","indexes":[]}
+  ]
+}
